@@ -1,0 +1,194 @@
+#cloud-config
+hostname: l2tp-server
+disable_root: false
+ssh_pwauth: false
+users:
+  - name: root
+    ssh_authorized_keys: ["@SSH_PUBKEY@"]
+  - name: debian
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys: ["@SSH_PUBKEY@"]
+package_update: true
+packages:
+  - linux-image-arm64
+  - strongswan-swanctl
+  - charon-systemd
+  - libstrongswan-extra-plugins
+  - libcharon-extra-plugins
+  - xl2tpd
+  - ppp
+  - iptables
+  - tcpdump
+  - iproute2
+write_files:
+  - path: /etc/swanctl/conf.d/l2tp.conf
+    content: |
+      connections {
+        l2tp-psk {
+          version = 1
+          aggressive = no
+          proposals = aes256-sha256-modp2048,aes128-sha1-modp2048,aes128-sha1-modp1024,3des-sha1-modp1024
+          local_addrs = %any
+          remote_addrs = %any
+          dpd_delay = 30s
+          dpd_timeout = 120s
+          rekey_time = 0
+          reauth_time = 0
+          local {
+            auth = psk
+          }
+          remote {
+            auth = psk
+          }
+          children {
+            l2tp {
+              mode = transport
+              local_ts = dynamic[udp/1701]
+              remote_ts = dynamic[udp]
+              esp_proposals = aes256-sha256,aes128-sha1,3des-sha1
+              dpd_action = clear
+              rekey_time = 0
+              life_time = 8h
+            }
+          }
+        }
+      }
+      secrets {
+        ike-l2tp {
+          secret = "testpsk123"
+        }
+      }
+  - path: /etc/strongswan.d/zz-l2tp-logging.conf
+    content: |
+      charon-systemd {
+        filelog {
+          charon {
+            path = /var/log/charon.log
+            time_format = %Y-%m-%d %H:%M:%S
+            ike_name = yes
+            append = yes
+            flush_line = yes
+            default = 1
+            ike = 2
+            knl = 2
+            net = 2
+            enc = 1
+            cfg = 2
+          }
+        }
+      }
+      charon {
+        filelog {
+          charon {
+            path = /var/log/charon.log
+            time_format = %Y-%m-%d %H:%M:%S
+            ike_name = yes
+            append = yes
+            flush_line = yes
+            default = 1
+            ike = 2
+            knl = 2
+            net = 2
+            enc = 1
+            cfg = 2
+          }
+        }
+      }
+  - path: /etc/xl2tpd/xl2tpd.conf
+    content: |
+      [global]
+      port = 1701
+      listen-addr = 0.0.0.0
+      debug avp = no
+      debug network = yes
+      debug state = yes
+      debug tunnel = yes
+
+      [lns default]
+      ip range = 192.168.42.10-192.168.42.50
+      local ip = 192.168.42.1
+      refuse chap = yes
+      refuse pap = yes
+      require authentication = yes
+      name = l2tp-server
+      ppp debug = yes
+      pppoptfile = /etc/ppp/options.xl2tpd
+      length bit = yes
+  - path: /etc/ppp/options.xl2tpd
+    content: |
+      name l2tp-server
+      auth
+      require-mschap-v2
+      refuse-pap
+      refuse-chap
+      refuse-mschap
+      refuse-eap
+      ms-dns 1.1.1.1
+      ms-dns 9.9.9.9
+      noccp
+      nodefaultroute
+      proxyarp
+      mtu 1400
+      mru 1400
+      lcp-echo-interval 30
+      lcp-echo-failure 4
+      debug
+      logfile /var/log/pppd.log
+  - path: /etc/ppp/chap-secrets
+    permissions: '0600'
+    content: |
+      # client   server   secret     IP addresses
+      "testuser" *        "testpass" *
+  - path: /etc/sysctl.d/90-l2tp.conf
+    content: |
+      net.ipv4.ip_forward = 1
+      net.ipv4.conf.all.accept_redirects = 0
+      net.ipv4.conf.all.send_redirects = 0
+  - path: /usr/local/sbin/l2tp-nat.sh
+    permissions: '0755'
+    content: |
+      #!/bin/sh
+      UPLINK=$(ip -4 route show default | awk '{print $5; exit}')
+      [ -n "$UPLINK" ] || UPLINK=$(ip -o link | awk -F': ' '$2!="lo"{print $2; exit}')
+      sysctl -w net.ipv4.ip_forward=1
+      iptables -t nat -C POSTROUTING -s 192.168.42.0/24 -o "$UPLINK" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -s 192.168.42.0/24 -o "$UPLINK" -j MASQUERADE
+      iptables -C FORWARD -s 192.168.42.0/24 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 192.168.42.0/24 -j ACCEPT
+      iptables -C FORWARD -d 192.168.42.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -d 192.168.42.0/24 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+      # clamp TCP MSS for the 1400-byte PPP link
+      iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
+        iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+  - path: /etc/systemd/system/l2tp-nat.service
+    content: |
+      [Unit]
+      Description=L2TP test server NAT/forwarding
+      After=network-online.target
+      Wants=network-online.target
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/usr/local/sbin/l2tp-nat.sh
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/modules-load.d/l2tp.conf
+    content: |
+      ppp_generic
+      ppp_async
+      ppp_deflate
+      l2tp_ppp
+runcmd:
+  - [sh, -c, 'DEBIAN_FRONTEND=noninteractive apt-get purge -y linux-image-cloud-arm64 "linux-image-*-cloud-arm64" > /var/log/kernel-swap.log 2>&1; update-grub >> /var/log/kernel-swap.log 2>&1']
+  - [sh, -c, 'touch /var/log/charon.log /var/log/pppd.log; chmod 600 /var/log/pppd.log']
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, --now, l2tp-nat.service]
+  - [systemctl, enable, strongswan.service, xl2tpd.service]
+  - [systemctl, restart, strongswan.service]
+  - [systemctl, restart, xl2tpd.service]
+  - [sh, -c, 'echo PROVISIONED > /var/log/provision-done']
+power_state:
+  mode: reboot
+  message: rebooting into generic kernel (ppp support)
+  timeout: 30
+  condition: true

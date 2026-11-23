@@ -1,0 +1,4 @@
+build/
+testserver/image/
+testserver/keys/
+testserver/run/
